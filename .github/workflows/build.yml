@@ -28,11 +28,12 @@ jobs:
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
             libssl-dev libelf-dev libncurses-dev device-tree-compiler \
             python3 git
-
+            
       - name: Clone upstream kernel
         run: |
-          git clone --depth 1 --branch v5.9-rc1-ferrari \
-            https://github.com/msm8939-mainline/msm8916-mainline-linux.git kernel
+          git clone --depth 1 \
+            https://github.com/msm8916-mainline/linux.git kernel
+          git -C kernel log -1 --oneline
 
       - name: Prepare local DTS and config
         run: |
