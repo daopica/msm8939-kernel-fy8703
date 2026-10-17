@@ -12,10 +12,22 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: fy8703-kernel-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+
+    env:
+      ARCH: arm64
+      CROSS_COMPILE: aarch64-linux-gnu-
+      DTS_NAME: msm8939-fy-8703
+      KERNEL_REPO: https://github.com/msm8916-mainline/linux.git
+      KERNEL_REF: master
+      BUILD_JOBS: '2'
 
     steps:
       - name: Checkout personal files
@@ -24,72 +36,169 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison flex build-essential \
+          sudo apt-get install -y \
+            bc bison flex build-essential \
             gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            libssl-dev libelf-dev libncurses-dev device-tree-compiler \
-            python3 git
-            
+            libssl-dev libelf-dev libncurses-dev \
+            device-tree-compiler python3 git \
+            rsync cpio kmod dwarves perl
+          mkdir -p output logs
+
       - name: Clone upstream kernel
         run: |
-          git clone --depth 1 \
-            https://github.com/msm8916-mainline/linux.git kernel
-          git -C kernel log -1 --oneline
+          set -euxo pipefail
+          git clone --depth 1 --branch "$KERNEL_REF" \
+            "$KERNEL_REPO" kernel
+          git -C kernel log -1 --format='%H%n%s' \
+            | tee output/source-commit.txt
+          git -C kernel remote -v > output/source-remote.txt
 
-      - name: Prepare local DTS and config
+      - name: Prepare DTS and register DTB
         run: |
-          set -eux
-          test -s dts/msm8939-fy-8703.dts
+          set -euxo pipefail
+          test -s "dts/$DTS_NAME.dts"
           test -s config/fy8703_defconfig
-          cp dts/msm8939-fy-8703.dts \
-            kernel/arch/arm64/boot/dts/qcom/msm8939-fy-8703.dts
+
+          QCOM=kernel/arch/arm64/boot/dts/qcom
+          mkdir -p "$QCOM" output logs
+
+          cp "dts/$DTS_NAME.dts" "$QCOM/$DTS_NAME.dts"
           cp config/fy8703_defconfig \
             kernel/arch/arm64/configs/fy8703_defconfig
-          grep -q 'msm8939-fy-8703.dtb' \
-            kernel/arch/arm64/boot/dts/qcom/Makefile || \
-            echo 'dtb-$(CONFIG_ARCH_QCOM) += msm8939-fy-8703.dtb' \
-            >> kernel/arch/arm64/boot/dts/qcom/Makefile
-          mkdir -p output
+
+          # 避免重复添加 Makefile 规则
+          RULE="dtb-\$(CONFIG_ARCH_QCOM) += $DTS_NAME.dtb"
+          grep -Fxq "$RULE" "$QCOM/Makefile" || \
+            printf '%s\n' "$RULE" >> "$QCOM/Makefile"
+
+          # 保存修改记录，便于检查
+          git -C kernel diff -- \
+            arch/arm64/boot/dts/qcom/Makefile \
+            > output/dts-makefile.diff
+          grep -nF "$DTS_NAME.dtb" "$QCOM/Makefile"
+
+      - name: Check DTS include dependencies
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import pathlib, re
+          root = pathlib.Path("kernel/arch/arm64/boot/dts/qcom")
+          src = root / "msm8939-fy-8703.dts"
+          errors, seen = [], set()
+          def scan(p):
+              p = p.resolve()
+              if p in seen: return
+              seen.add(p)
+              try: data = p.read_text()
+              except Exception as e:
+                  errors.append(f"READ: {p}: {e}")
+                  return
+              for name in re.findall(r'^\s*#include\s+"([^"]+)"', data, re.M):
+                  candidates = [p.parent / name, root / name]
+                  found = next((x for x in candidates if x.is_file()), None)
+                  if found: scan(found)
+                  else: errors.append(f"MISSING: {p}: {name}")
+              for name in re.findall(r'^\s*#include\s+<([^>]+)>', data, re.M):
+                  candidates = [root / name, root.parent / name]
+                  if not any(x.is_file() for x in candidates):
+                      errors.append(f"CHECK: {p}: {name}")
+          scan(src)
+          out = pathlib.Path("logs/dts-dependencies.log")
+          out.write_text("\n".join(errors) if errors else "DTS includes found\n")
+          print(out.read_text())
+          PY
 
       - name: Configure kernel
         working-directory: kernel
         run: |
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-          scripts/kconfig/merge_config.sh -m .config ../config/fy8703_defconfig
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          set -euxo pipefail
+          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" defconfig
+          scripts/kconfig/merge_config.sh -m .config \
+            arch/arm64/configs/fy8703_defconfig \
+            2>&1 | tee ../logs/config-merge.log
+          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" olddefconfig \
+            2>&1 | tee ../logs/configure.log
           cp .config ../output/kernel.config
-
-      - name: Build kernel and upstream DTB
-        working-directory: kernel
-        run: |
-          set -o pipefail
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j2 \
-            Image qcom/msm8939-xiaomi-ferrari.dtb 2>&1 | tee ../output/build.log
+          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" savedefconfig
+          cp defconfig ../output/defconfig.resolved
 
       - name: Build FY8703 DTB
-        working-directory: kernel
+        id: dtb
         continue-on-error: true
+        working-directory: kernel
         run: |
           set -o pipefail
-          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            qcom/msm8939-fy-8703.dtb 2>&1 | tee ../output/fy8703-dtb.log
+          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            -j"$BUILD_JOBS" "qcom/$DTS_NAME.dtb" \
+            2>&1 | tee ../logs/fy8703-dtb.log
 
-      - name: Collect artifacts
+      - name: Build kernel Image
+        id: image
+        continue-on-error: true
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          make ARCH="$ARCH" CROSS_COMPILE="$CROSS_COMPILE" \
+            -j"$BUILD_JOBS" Image \
+            2>&1 | tee ../logs/build.log
+
+      - name: Extract build errors
         if: always()
         run: |
-          mkdir -p output
+          python3 - <<'PY'
+          import pathlib, re
+          files = [
+              pathlib.Path("logs/fy8703-dtb.log"),
+              pathlib.Path("logs/build.log"),
+              pathlib.Path("logs/configure.log"),
+              pathlib.Path("logs/config-merge.log"),
+          ]
+          patterns = re.compile(
+              r'error:|fatal error:|undefined reference|'
+              r'No rule to make target|Error [0-9]+|'
+              r'FATAL ERROR|syntax error|not found|'
+              r'warning:.*treated as error',
+              re.I)
+          out = pathlib.Path("output/errors-summary.txt")
+          lines = []
+          for f in files:
+              if not f.exists(): continue
+              for n, line in enumerate(f.read_text(errors="replace").splitlines(), 1):
+                  if patterns.search(line):
+                      lines.append(f"{f}:{n}: {line}")
+          out.write_text("\n".join(lines) if lines else "No matching errors found.\n")
+          print(out.read_text()[-30000:])
+          PY
+
+      - name: Collect artifacts and diagnostics
+        if: always()
+        run: |
+          mkdir -p output logs
           cp kernel/arch/arm64/boot/Image output/ 2>/dev/null || true
-          cp kernel/arch/arm64/boot/dts/qcom/msm8939-xiaomi-ferrari.dtb \
+          cp kernel/arch/arm64/boot/dts/qcom/$DTS_NAME.dtb \
             output/ 2>/dev/null || true
-          cp kernel/arch/arm64/boot/dts/qcom/msm8939-fy-8703.dtb \
-            output/ 2>/dev/null || true
-          git -C kernel rev-parse HEAD > output/source-commit.txt 2>/dev/null || true
+          cp kernel/.config output/kernel.config 2>/dev/null || true
+          git -C kernel rev-parse HEAD \
+            > output/source-commit.txt 2>/dev/null || true
+          find kernel/arch/arm64/boot -maxdepth 1 \
+            -type f -printf '%f %s bytes\n' \
+            > output/kernel-artifacts.txt 2>/dev/null || true
+          git -C kernel diff --check \
+            > output/diff-check.txt 2>&1 || true
+          {
+            echo "DTB step: ${{ steps.dtb.outcome }}"
+            echo "Image step: ${{ steps.image.outcome }}"
+            echo "Commit: $(cat output/source-commit.txt 2>/dev/null || true)"
+          } > output/build-status.txt
           ls -lh output
 
-      - name: Upload build artifacts
+      - name: Upload build artifacts and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: msm8939-fy8703-build
-          path: output/
+          name: msm8939-fy8703-build-${{ github.run_number }}
+          path: |
+            output/
+            logs/
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 14
