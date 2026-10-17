@@ -1,0 +1,94 @@
+name: MSM8939 FY8703 Kernel Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'dts/**'
+      - 'config/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout personal files
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex build-essential \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            libssl-dev libelf-dev libncurses-dev device-tree-compiler \
+            python3 git
+
+      - name: Clone upstream kernel
+        run: |
+          git clone --depth 1 --branch v5.9-rc1-ferrari \
+            https://github.com/msm8939-mainline/msm8916-mainline-linux.git kernel
+
+      - name: Prepare local DTS and config
+        run: |
+          set -eux
+          test -s dts/msm8939-fy-8703.dts
+          test -s config/fy8703_defconfig
+          cp dts/msm8939-fy-8703.dts \
+            kernel/arch/arm64/boot/dts/qcom/msm8939-fy-8703.dts
+          cp config/fy8703_defconfig \
+            kernel/arch/arm64/configs/fy8703_defconfig
+          grep -q 'msm8939-fy-8703.dtb' \
+            kernel/arch/arm64/boot/dts/qcom/Makefile || \
+            echo 'dtb-$(CONFIG_ARCH_QCOM) += msm8939-fy-8703.dtb' \
+            >> kernel/arch/arm64/boot/dts/qcom/Makefile
+          mkdir -p output
+
+      - name: Configure kernel
+        working-directory: kernel
+        run: |
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          scripts/kconfig/merge_config.sh -m .config ../config/fy8703_defconfig
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          cp .config ../output/kernel.config
+
+      - name: Build kernel and upstream DTB
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j2 \
+            Image qcom/msm8939-xiaomi-ferrari.dtb 2>&1 | tee ../output/build.log
+
+      - name: Build FY8703 DTB
+        working-directory: kernel
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            qcom/msm8939-fy-8703.dtb 2>&1 | tee ../output/fy8703-dtb.log
+
+      - name: Collect artifacts
+        if: always()
+        run: |
+          mkdir -p output
+          cp kernel/arch/arm64/boot/Image output/ 2>/dev/null || true
+          cp kernel/arch/arm64/boot/dts/qcom/msm8939-xiaomi-ferrari.dtb \
+            output/ 2>/dev/null || true
+          cp kernel/arch/arm64/boot/dts/qcom/msm8939-fy-8703.dtb \
+            output/ 2>/dev/null || true
+          git -C kernel rev-parse HEAD > output/source-commit.txt 2>/dev/null || true
+          ls -lh output
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: msm8939-fy8703-build
+          path: output/
+          if-no-files-found: warn
+          retention-days: 7
